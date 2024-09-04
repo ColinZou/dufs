@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{self, Component, Path, PathBuf};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -265,7 +265,7 @@ impl Server {
                                 status_not_found(&mut res);
                                 return Ok(res);
                             }
-                            self.handle_zip_dir(path, head_only, access_paths, &mut res)
+                            self.handle_zip_dir(path, head_only, access_paths, &mut res, false)
                                 .await?;
                         } else if allow_search && query_params.contains_key("q") {
                             self.handle_search_dir(
@@ -305,7 +305,7 @@ impl Server {
                             status_not_found(&mut res);
                             return Ok(res);
                         }
-                        self.handle_zip_dir(path, head_only, access_paths, &mut res)
+                        self.handle_zip_dir(path, head_only, access_paths, &mut res, false)
                             .await?;
                     } else if allow_search && query_params.contains_key("q") {
                         self.handle_search_dir(
@@ -339,8 +339,24 @@ impl Server {
                     } else if has_query_flag(&query_params, "hash") {
                         self.handle_hash_file(path, head_only, &mut res).await?;
                     } else {
-                        self.handle_send_file(path, headers, head_only, &mut res)
-                            .await?;
+                        let do_zip = has_query_flag(&query_params, "zip");
+                        let path_str = path
+                            .to_owned()
+                            .to_path_buf()
+                            .to_owned()
+                            .into_os_string()
+                            .into_string()
+                            .unwrap();
+                        print!(
+                            "Need to zip {do_zip} allow_archive {allow_archive} with {path_str}\n"
+                        );
+                        if allow_archive && do_zip {
+                            self.handle_zip_dir(path, head_only, access_paths, &mut res, true)
+                                .await?;
+                        } else {
+                            self.handle_send_file(path, headers, head_only, &mut res)
+                                .await?;
+                        }
                     }
                 } else if render_spa {
                     self.handle_render_spa(path, headers, head_only, &mut res)
@@ -655,6 +671,7 @@ impl Server {
         head_only: bool,
         access_paths: AccessPaths,
         res: &mut Response,
+        one_file: bool,
     ) -> Result<()> {
         let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
         let filename = try_get_file_name(path)?;
@@ -664,10 +681,22 @@ impl Server {
         if head_only {
             return Ok(());
         }
-        let path = path.to_owned();
+        let mut path = path.to_owned();
         let hidden = self.args.hidden.clone();
         let running = self.running.clone();
         let compression = self.args.compress.to_compression();
+        let mut files_to_download: Vec<String> = Vec::new();
+        if one_file {
+            let file_path = path
+                .to_owned()
+                .into_os_string()
+                .into_string()
+                .unwrap()
+                .to_owned();
+            path = path.parent().unwrap().to_path_buf().to_owned();
+            //println!("will just download one file: {}\n", file_path.clone());
+            files_to_download.push(file_path.clone());
+        }
         tokio::spawn(async move {
             if let Err(e) = zip_dir(
                 &mut writer,
@@ -676,6 +705,7 @@ impl Server {
                 &hidden,
                 compression,
                 running,
+                files_to_download,
             )
             .await
             {
@@ -1596,46 +1626,61 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     hidden: &[String],
     compression: Compression,
     running: Arc<AtomicBool>,
+    file_list: Vec<String>,
 ) -> Result<()> {
     let mut writer = ZipFileWriter::with_tokio(writer);
     let hidden = Arc::new(hidden.to_vec());
     let dir_clone = dir.to_path_buf();
+    /*
+    println!(
+        "Zipping directory: {}, file items only: {}",
+        dir.to_owned().into_os_string().into_string().unwrap(),
+        file_list.join(",")
+    );
+    */
     let zip_paths = tokio::task::spawn_blocking(move || {
         let mut paths: Vec<PathBuf> = vec![];
-        for dir in access_paths.child_paths(&dir_clone) {
-            let mut it = WalkDir::new(&dir).into_iter();
-            it.next();
-            while let Some(Ok(entry)) = it.next() {
-                if !running.load(atomic::Ordering::SeqCst) {
-                    break;
-                }
-                let entry_path = entry.path();
-                let base_name = get_file_name(entry_path);
-                let file_type = entry.file_type();
-                let mut is_dir_type: bool = file_type.is_dir();
-                if file_type.is_symlink() {
-                    match std::fs::symlink_metadata(entry_path) {
-                        Ok(meta) => {
-                            is_dir_type = meta.is_dir();
-                        }
-                        Err(_) => {
-                            continue;
+        if file_list.is_empty() {
+            for dir in access_paths.child_paths(&dir_clone) {
+                let mut it = WalkDir::new(&dir).into_iter();
+                it.next();
+                while let Some(Ok(entry)) = it.next() {
+                    if !running.load(atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let entry_path = entry.path();
+                    let base_name = get_file_name(entry_path);
+                    let file_type = entry.file_type();
+                    let mut is_dir_type: bool = file_type.is_dir();
+                    if file_type.is_symlink() {
+                        match std::fs::symlink_metadata(entry_path) {
+                            Ok(meta) => {
+                                is_dir_type = meta.is_dir();
+                            }
+                            Err(_) => {
+                                continue;
+                            }
                         }
                     }
-                }
-                if is_hidden(&hidden, base_name, is_dir_type) {
-                    if file_type.is_dir() {
-                        it.skip_current_dir();
+                    if is_hidden(&hidden, base_name, is_dir_type) {
+                        if file_type.is_dir() {
+                            it.skip_current_dir();
+                        }
+                        continue;
                     }
-                    continue;
+                    if entry.path().symlink_metadata().is_err() {
+                        continue;
+                    }
+                    if !file_type.is_file() {
+                        continue;
+                    }
+                    let entry_path = entry_path.to_path_buf();
+                    paths.push(entry_path);
                 }
-                if entry.path().symlink_metadata().is_err() {
-                    continue;
-                }
-                if !file_type.is_file() {
-                    continue;
-                }
-                paths.push(entry_path.to_path_buf());
+            }
+        } else {
+            for file in file_list {
+                paths.push(path::PathBuf::from(file));
             }
         }
         paths
